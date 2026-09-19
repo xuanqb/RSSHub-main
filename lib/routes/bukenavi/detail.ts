@@ -1,24 +1,32 @@
 import { load } from 'cheerio';
 
 import type { ListingExtra } from '@/routes/temposmart/utils';
-import { clean, normalizeFloor, parseArea, parseJpy, parseWalkMin, parseWard, summarize, tsuboUnit } from '@/routes/temposmart/utils';
+import { clean, normalizeFloor, parseArea, parseCondition, parseHeavyFood, parseJpy, parseWalkMin, parseWard, summarize, tsuboUnit } from '@/routes/temposmart/utils';
 import type { Data, DataItem, Route } from '@/types';
 import cache from '@/utils/cache';
 import ofetch from '@/utils/ofetch';
 
 const HOST = 'https://bukenavi.jp';
+/**
+ * `initMap()` pins the map at the listing's own coordinates — googleMap('map', 区名, lat, lng, false).
+ * The label it passes is only the ward, which is why the page looks ward-level, but the pin is not:
+ * five 歌舞伎町 listings carry five different pairs, spread over ~265m × 440m. So the exact location is
+ * published to guests even though 住所 stops at the 町.
+ */
+const MAP_CALL = /googleMap\(\s*'[^']*',\s*'[^']*',\s*'([\d.-]+)',\s*'([\d.-]+)'/;
 const REGIONS = new Set(['kanto', 'kansai', 'tokai', 'kyushu']);
 
 /**
  * One listing, from `/{region}/object/{id}` — the id-only URL serves the same page as the station-named one.
  *
- * The address is deliberately **not** improved here: ぶけなび truncates 住所 to the 町 for guests and says so
- * ('東京都新宿区歌舞伎町 ※詳細はお問い合わせください（住所詳細は会員限定）'), so the 丁目 is unreachable without
- * an account and this route cannot do better than the area route on that field. What it does add is everything
- * the list card omits: 乗降者数, 構造, 竣工年月, 立地, 間口, 業種, 不可業態, 営業年数 and 特記事項.
+ * 住所 is truncated to the 町 for guests ('東京都新宿区歌舞伎町 ※詳細はお問い合わせください（住所詳細は会員限定）'),
+ * so `address_hint` stops there — but the page's own map pin does not, and `raw.lat` / `raw.lng` carry the
+ * listing's exact coordinates without an account. It also adds everything the list card omits: 乗降者数,
+ * 構造, 竣工年月, 立地, 間口, 業種, 不可業態, 営業年数 and 特記事項.
  */
 const parseDetail = (html: string, region: string, id: string): DataItem | null => {
     const $ = load(html);
+    const map = MAP_CALL.exec(html);
 
     const rows = new Map<string, string>();
     for (const tr of $('table.box__property__table tr').toArray()) {
@@ -55,10 +63,14 @@ const parseDetail = (html: string, region: string, id: string): DataItem | null 
         business_types: row('業種'),
         excluded_business: row('不可業態'),
         notes: row('特記事項'),
+        lat: map?.[1] ?? null,
+        lng: map?.[2] ?? null,
     };
 
     // '1,419,000円 @4.73万円' — the 坪単価 follows the rent after an @.
     const [rentText, unitText] = (raw.rent ?? '').split('@', 2);
+    // Same shape as the area route, so the two bukenavi routes stay comparable.
+    const limitParts = [raw.business_types === null ? null : `可: ${raw.business_types}`, raw.excluded_business === null ? null : `不可: ${raw.excluded_business}`].filter((p): p is string => p !== null);
     const { tsubo, area_m2 } = parseArea(raw.size);
     const rentJpy = parseJpy(clean(rentText));
 
@@ -78,14 +90,17 @@ const parseDetail = (html: string, region: string, id: string): DataItem | null 
         deposit_jpy: null,
         key_money_months: null,
         fixtures_transfer_jpy: null,
-        condition: null,
+        condition: parseCondition(title),
         prev_business: raw.prev_business,
-        heavy_food_ok: null,
-        business_limit: [raw.business_types, raw.excluded_business === null ? null : `不可: ${raw.excluded_business}`].filter((p): p is string => p !== null).join(' / ') || null,
+        // As on the area route: only an explicit 重飲食可 / 不可 counts, never the absence of 飲食 from
+        // the NG list, which says nothing about heavy food either way.
+        heavy_food_ok: parseHeavyFood(raw.excluded_business, raw.business_types),
+        business_limit: limitParts.length > 0 ? limitParts.join(' / ') : null,
         // The site publishes no listing date.
         listed_at: null,
         ward: parseWard(raw.address),
-        // Town-level only: the 丁目 is behind the site's own 会員限定 notice.
+        // Town-level: the 丁目 is behind the site's 会員限定 notice, so raw.lat / raw.lng are the precise
+        // location here, not this string. Some listings do end in a bare 丁目 number ('浅草 1').
         address_hint: raw.address?.split('※', 1)[0]?.trim() ?? null,
         tags: [],
         raw,
@@ -146,7 +161,7 @@ export const route: Route = {
 
 It adds what the area route's cards omit: 乗降者数 for the nearest station, 構造，竣工年月，立地，間口，業種，不可業態，営業年数 and 特記事項，plus exact 面積 and 階数.
 
-**It does not improve the address.** ぶけなび truncates 住所 to the 町 for guests and says so on the page — 「東京都新宿区歌舞伎町 ※詳細はお問い合わせください（住所詳細は会員限定）」 — so the 丁目 is unreachable without an account, and \`address_hint\` stops at the 町 here exactly as it does on the area route. 敷金，礼金 and 造作 are likewise absent from the guest view, and the site publishes no listing date, so those fields stay \`null\`.`,
+**The exact location is in \`raw.lat\` / \`raw.lng\`, not in the address.** ぶけなび truncates 住所 to the 町 for guests and says so on the page — 「東京都新宿区歌舞伎町 ※詳細はお問い合わせください（住所詳細は会員限定）」 — so \`address_hint\` stops at the 町. The page's own map pin does not: \`initMap()\` is called with the listing's coordinates, and five 歌舞伎町 listings carry five different pairs spread over roughly 265m × 440m, so these are per-property positions rather than a geocode of the town. That makes them finer than the 丁目 the address withholds, and no account is needed for them. 敷金，礼金 and 造作 are absent from the guest view, and the site publishes no listing date, so those stay \`null\`.`,
     categories: ['other'],
     features: {
         requireConfig: false,
